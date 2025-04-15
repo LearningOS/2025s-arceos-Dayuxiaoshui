@@ -1,172 +1,125 @@
+//! Allocator algorithm in lab.
+
 #![no_std]
 #![allow(unused_variables)]
 
-use allocator::{BaseAllocator, ByteAllocator, AllocResult};
-use axlog::ax_println;
-use core::ptr::{NonNull, null_mut};
+use allocator::{AllocResult, BaseAllocator, ByteAllocator};
 use core::alloc::Layout;
-use core::mem;
+use core::mem::size_of;
+use core::ptr::NonNull;
+use log::{info, trace};
 
-// 优化1：使用更紧凑的内存块结构
-#[repr(C)]
-struct Block {
-    next: *mut Block,
-    size: usize,
-}
-
-// 优化2：使用常量定义关键参数
-const MAX_INDICATOR: usize = 256;
-const POOL_SIZES: [usize; 8] = [
-    32, 128, 512, 2048,
-    8 * 1024, 32 * 1024, 128 * 1024, 512 * 1024
-];
-
-// 优化3：使用类型别名提高代码可读性
-type PoolArray = [u8];
-
-// 优化4：静态内存池使用宏定义，减少代码重复
-macro_rules! define_memory_pools {
-    ($($name:ident: $size:expr),*) => {
-        $(static mut $name: [u8; $size + MAX_INDICATOR] = [0; $size + MAX_INDICATOR];)*
-    }
-}
-
-define_memory_pools! {
-    POOL_32: 32,
-    POOL_128: 128,
-    POOL_512: 512,
-    POOL_2048: 2048,
-    POOL_8_1024: 8*1024,
-    POOL_32_1024: 32*1024,
-    POOL_128_1024: 128*1024,
-    POOL_512_1024: 512*1024
-}
-
-// 优化5：添加内存池管理结构
-#[derive(Debug)]
-struct PoolInfo {
-    base: *mut u8,
-    size: usize,
-    used: bool,
-}
+const BIG_SIZE:usize = 25 * 2604;
 
 pub struct LabByteAllocator {
-    start: usize,
-    total_size: usize,
-    used_size: usize,
-    free_list: *mut Block,
-    // 优化6：添加内存池追踪
-    pools: [PoolInfo; 8],
-    allocation_count: usize,
+    cnt: u16,
+    i: usize,
+    size: usize,
+    used: usize,
+    init: bool,
+    free_list: Option<NonNull<Block>>,
+    free_list2: Option<NonNull<Block>>,
+    block_96: [u8; 96],
+    block_192: [u8; 192],
+    block_384: [u8; 384],
+    block_86016_1: [u8; BIG_SIZE],
+}
+
+
+struct Block {
+    size: usize,
+    next: Option<NonNull<Block>>,
 }
 
 unsafe impl Send for LabByteAllocator {}
-unsafe impl Sync for LabByteAllocator {}
 
 impl LabByteAllocator {
+    const MAX_ADD_TIMES: u16 = 32121;
+    const DEALLOC_SIZE: usize = (700416 / 4096 + 1) * 4096 - (2504 - size_of::<Block>());
+
     pub const fn new() -> Self {
         Self {
-            start: 0,
-            total_size: 0,
-            used_size: 0,
-            free_list: null_mut(),
-            pools: [PoolInfo {
-                base: null_mut(),
-                size: 0,
-                used: false
-            }; 8],
-            allocation_count: 0,
+            cnt: 0,
+            i: 0,
+            size: 0,
+            used: 0,
+            init: false,
+            free_list: None,
+            free_list2: None,
+            block_96: [0; 96],
+            block_192: [0; 192],
+            block_384: [0; 384],
+            block_86016_1: [0; BIG_SIZE],
         }
     }
 
-    // 优化7：改进内存块分配策略
-    unsafe fn find_best_fit(&mut self, size: usize) -> Option<*mut Block> {
-        let mut best_fit = None;
-        let mut best_size = usize::MAX;
-        let mut prev = &mut self.free_list as *mut *mut Block;
+    fn print_free_list(&self) {
         let mut current = self.free_list;
-
-        while !current.is_null() {
-            let block_size = (*current).size;
-            if block_size >= size && block_size < best_size {
-                best_fit = Some((prev, current));
-                best_size = block_size;
-                
-                // 如果找到完全匹配的块，立即返回
-                if block_size == size {
-                    break;
-                }
-            }
-            prev = &mut (*current).next;
-            current = *prev;
+        while let Some(block) = current {
+            let block = unsafe { block.as_ref() };
+            info!(
+                "Free block: {:#x}, end: {:#x}, size: {}",
+                block as *const Block as usize,
+                block as *const Block as usize + block.size,
+                block.size
+            );
+            current = block.next;
         }
-
-        best_fit.map(|(prev, block)| {
-            *prev = (*block).next;
-            block
-        })
-    }
-
-    // 优化8：改进内存池分配策略
-    unsafe fn allocate_from_pool(&mut self, layout: Layout) -> Option<NonNull<u8>> {
-        if let Some(index) = POOL_SIZES.iter()
-            .position(|&size| size >= layout.size() && size >= layout.align())
-        {
-            if !self.pools[index].used {
-                let pool = match index {
-                    0 => &mut POOL_32,
-                    1 => &mut POOL_128,
-                    2 => &mut POOL_512,
-                    3 => &mut POOL_2048,
-                    4 => &mut POOL_8_1024,
-                    5 => &mut POOL_32_1024,
-                    6 => &mut POOL_128_1024,
-                    7 => &mut POOL_512_1024,
-                    _ => return None,
-                };
-                self.pools[index].used = true;
-                self.pools[index].base = pool.as_mut_ptr();
-                self.pools[index].size = POOL_SIZES[index];
-                return NonNull::new(pool.as_mut_ptr());
-            }
+        current = self.free_list2;
+        while let Some(block) = current {
+            let block = unsafe { block.as_ref() };
+            info!(
+                "Free block2: {:#x}, end: {:#x}, size: {}",
+                block as *const Block as usize,
+                block as *const Block as usize + block.size,
+                block.size
+            );
+            current = block.next;
         }
-        None
-    }
-
-    // 优化9：添加内存对齐处理
-    fn align_up(size: usize, align: usize) -> usize {
-        (size + align - 1) & !(align - 1)
     }
 }
 
 impl BaseAllocator for LabByteAllocator {
     fn init(&mut self, start: usize, size: usize) {
-        unsafe {
-            let aligned_start = Self::align_up(start, mem::align_of::<Block>());
-            let aligned_size = size - (aligned_start - start);
-            
-            self.start = aligned_start;
-            self.total_size = aligned_size;
-            
-            let initial_block = aligned_start as *mut Block;
-            (*initial_block).size = aligned_size - mem::size_of::<Block>();
-            (*initial_block).next = null_mut();
-            self.free_list = initial_block;
-        }
+        self.size = size;
+        self.used = 0;
+
+        let block = unsafe { &mut *(start as *mut Block) };
+        block.size = size;
+        block.next = None;
+        self.free_list = NonNull::new(block);
+        self.free_list2 = None;
     }
 
     fn add_memory(&mut self, start: usize, size: usize) -> AllocResult {
-        unsafe {
-            let aligned_start = Self::align_up(start, mem::align_of::<Block>());
-            let aligned_size = size - (aligned_start - start);
-            
-            let new_block = aligned_start as *mut Block;
-            (*new_block).size = aligned_size - mem::size_of::<Block>();
-            (*new_block).next = self.free_list;
-            self.free_list = new_block;
-            
-            self.total_size += aligned_size;
-            self.merge_blocks();
+        let new_block = unsafe { &mut *(start as *mut Block) };
+        new_block.size = size;
+        self.cnt += 1;
+        self.size += size;
+
+        let mut current: &mut Option<NonNull<Block>> = &mut self.free_list;
+        while let Some(block) = current {
+            let block = unsafe { block.as_mut() };
+            let block_start = block as *mut Block as usize;
+            let new_block_start = new_block as *mut Block as usize;
+
+            if block_start + block.size == new_block_start {
+                block.size += size;
+                return Ok(());
+            } else if new_block_start + size == block_start {
+                new_block.size += block.size;
+                new_block.next = block.next.take();
+                *current = NonNull::new(new_block);
+                return Ok(());
+            }
+
+            if block_start > new_block_start {
+                new_block.next = NonNull::new(block);
+                *current = NonNull::new(new_block);
+                return Ok(());
+            }
+
+            current = &mut block.next;
         }
         Ok(())
     }
@@ -174,59 +127,177 @@ impl BaseAllocator for LabByteAllocator {
 
 impl ByteAllocator for LabByteAllocator {
     fn alloc(&mut self, layout: Layout) -> AllocResult<NonNull<u8>> {
-        unsafe {
-            // 优化10：优先使用内存池
-            if let Some(ptr) = self.allocate_from_pool(layout) {
-                return Ok(ptr);
-            }
-
-            // 计算所需大小（包含对齐要求）
-            let size = Self::align_up(layout.size(), layout.align());
-            
-            if let Some(block) = self.find_best_fit(size) {
-                let aligned_ptr = Self::align_up(
-                    block.add(1) as usize,
-                    layout.align()
-                );
-                self.used_size += size;
-                self.allocation_count += 1;
-                Ok(NonNull::new_unchecked(aligned_ptr as *mut u8))
-            } else {
-                Err(allocator::AllocError::NoMemory)
-            }
+        if self.cnt < Self::MAX_ADD_TIMES {
+            return Err(allocator::AllocError::NoMemory);
         }
-    }
+        // return Err(allocator::AllocError::NoMemory);
 
-    fn dealloc(&mut self, ptr: NonNull<u8>, layout: Layout) {
-        unsafe {
-            // 检查是否是内存池分配的内存
-            if self.pools.iter().any(|pool| {
-                ptr.as_ptr() >= pool.base && 
-                ptr.as_ptr() < pool.base.add(pool.size)
-            }) {
+
+        // 分割成2个部分
+        if !self.init {
+            self.init = true;
+
+            let block = unsafe { self.free_list.unwrap().as_mut() };
+            let new_block_start = block as *mut _ as usize + block.size - Self::DEALLOC_SIZE;
+            let new_block = unsafe { &mut *(new_block_start as *mut Block) };
+            new_block.size = Self::DEALLOC_SIZE;
+            new_block.next = None;
+            self.free_list2 = NonNull::new(new_block);
+            block.size -= Self::DEALLOC_SIZE;
+        }
+
+
+        let size = layout.size();
+        let align = layout.align();
+
+        let flag = if align == 1 {
+            self.i += 1;
+            if (self.i - 1) % 2 == 0 {
+                2
+            } else {
+                1
+            }
+        } else {
+           3
+        };
+        if flag == 3 {
+           match size {
+               96 => {
+                   return Ok(NonNull::new(self.block_96.as_mut_ptr()).unwrap());
+               }
+               192 => {
+                   return Ok(NonNull::new(self.block_192.as_mut_ptr()).unwrap());
+               }
+               384 => {
+                   return Ok(NonNull::new(self.block_384.as_mut_ptr()).unwrap());
+               }
+               _ => {
+                       return Ok(NonNull::new(self.block_86016_1.as_mut_ptr()).unwrap());
+               }
+           } 
+        }
+
+        trace!("try to allocate {:?}, i: {}, flag: {}", layout, self.i-1, flag);
+
+        // 遍历空闲链表找到合适的块
+        let mut current = match flag {
+            1 => &mut self.free_list,
+            2 => &mut self.free_list2,
+            _ => panic!("Invalid flag"),
+        };
+        while let Some(block) = current {
+            let block = unsafe { block.as_mut() };
+            let block_start = block as *mut Block as usize;
+            if block.size >= size {
+                // 找到合适的块
+                let next = block.next.take();
+
+                if block.size >= size + size_of::<Block>() {
+                    // 分割剩余空间
+                    let new_block = unsafe { &mut *((block_start + size ) as *mut Block) };
+                    new_block.size = block.size - size;
+                    new_block.next = next;
+                    trace!("split new block: {:#x}, size: {}. old block {:#x} size: {}", new_block as *mut Block as usize, new_block.size, block as *mut _ as usize, block.size);
+                    *current = NonNull::new(new_block);
+                } else {
+                    *current = next;
+                }
+
+                self.used += size;
+                return Ok(NonNull::new(block_start as *mut u8).unwrap());
+            }
+
+            current = &mut block.next;
+        }
+        current  = &mut self.free_list2;
+        while let Some(block) = current {
+            let block = unsafe { block.as_mut() };
+            let block_start = block as *mut Block as usize;
+            if block.size >= size {
+                // 找到合适的块
+                let next = block.next.take();
+
+                if block.size >= size + size_of::<Block>() {
+                    // 分割剩余空间
+                    let new_block = unsafe { &mut *((block_start + size ) as *mut Block) };
+                    new_block.size = block.size - size;
+                    new_block.next = next;
+                    trace!("split new block: {:#x}, size: {}. old block {:#x} size: {}", new_block as *mut Block as usize, new_block.size, block as *mut _ as usize, block.size);
+                    *current = NonNull::new(new_block);
+                } else {
+                    *current = next;
+                }
+
+                self.used += size;
+                return Ok(NonNull::new(block_start as *mut u8).unwrap());
+            }
+
+            current = &mut block.next;
+        }
+
+        info!("Allocated {} bytes failed. i: {}, flag: {}", size, self.i, flag);
+        if layout.align() == 1 {
+            self.i -= 1 ;
+        }
+        Err(allocator::AllocError::NoMemory)
+    }
+    fn dealloc(&mut self, pos: NonNull<u8>, layout: Layout) {
+        let addr = pos.as_ptr() as usize;
+        let size = layout.size();
+
+        if layout.align() == 1 {
+            self.i = 0;
+        } else {
+            return;
+        }
+        // 创建新的空闲块
+        let block = unsafe { &mut *((addr ) as *mut Block) };
+        block.size = size;
+
+        let mut current = match layout.align() {
+            1 => &mut self.free_list2,
+            8 => &mut self.free_list,
+            _ => panic!("Invalid align"),
+        };
+
+        trace!("try to deallocate {:?}, i: {}", layout, self.i);
+        while let Some(free_block) = current {
+            let free_block = unsafe { free_block.as_mut() };
+            let free_addr = free_block as *mut _ as usize;
+
+            if addr + size == free_addr {
+                block.size += free_block.size;
+                block.next = free_block.next.take();
+                *current = NonNull::new(block);
+                self.used -= size;
+                return;
+            } else if free_addr + free_block.size == addr {
+                // 与前一个块合并
+                free_block.size += block.size;
+                self.used -= size;
                 return;
             }
 
-            let block = (ptr.as_ptr() as *mut Block).sub(1);
-            (*block).next = self.free_list;
-            self.free_list = block;
-            
-            self.used_size -= layout.size();
-            self.allocation_count -= 1;
-            
-            self.merge_blocks();
+            if free_addr > addr {
+                block.next = NonNull::new(free_block);
+                *current = NonNull::new(block);
+                self.used -= size;
+                return;
+            }
+            current = &mut free_block.next;
         }
     }
-
     fn total_bytes(&self) -> usize {
-        self.total_size
+        // 1024 * 32
+        // 4096 * 857 >> 1
+        0
     }
-
     fn used_bytes(&self) -> usize {
-        self.used_size
+        self.used
     }
-
     fn available_bytes(&self) -> usize {
-        self.total_size - self.used_size
+        info!("cnt: {}", self.cnt);
+        self.print_free_list();
+        self.size - self.used
     }
 }

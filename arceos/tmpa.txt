@@ -1,4 +1,6 @@
     [92;1mCreating[0m FAT32 disk image "disk.img" ...
 mkfs.fat 4.2 (2021-01-31)
-    [92;1mBuilding[0m App: lab1, Arch: riscv64, Platform: riscv64-qemu-virt, App type: rust
-[37mcargo -C labs/lab1 build[0m [90m-Z unstable-options --target riscv64gc-unknown-none-elf --target-dir /home/myroot/taining/2025s-arceos-Dayuxiaoshui/arceos/target --release  --features "axstd/log-level-warn"[0m
+Indicator: 373
+[37m[  0.467601 0 axruntime::lang_items:5] [31mpanicked at modules/axalloc/src/lib.rs:124:31:
+Bumb: NoMemory.[m
+[m

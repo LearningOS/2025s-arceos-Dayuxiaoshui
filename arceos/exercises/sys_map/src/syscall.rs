@@ -7,7 +7,8 @@ use axerrno::LinuxError;
 use axtask::current;
 use axtask::TaskExtRef;
 use axhal::paging::MappingFlags;
-use arceos_posix_api as api;
+use arceos_posix_api::{self as api, get_file_like};
+use memory_addr::{MemoryAddr, VirtAddr, VirtAddrRange};
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -140,7 +141,43 @@ fn sys_mmap(
     fd: i32,
     _offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    let current = current();
+    let mut uspace = current.task_ext().aspace.lock();
+    let Some(vaddr) = uspace.find_free_area(
+        VirtAddr::from(addr as usize + 0x20_0000), 
+        length.align_up_4k(),
+        VirtAddrRange::from_start_size(uspace.base(), uspace.size()),
+    ) else {
+        ax_println!("find_free_area failed");
+        return 0;
+    };
+
+    let flags = MmapProt::from_bits_truncate(prot);
+    if let Err(e) = uspace.map_alloc(vaddr, length.align_up_4k(), flags.into(), true) {
+        ax_println!("map_alloc failed: {}", e);
+        return 0;
+    }
+
+    let file = match get_file_like(fd) {
+        Ok(file) => file,
+        Err(e) => {
+            ax_println!("get_file_like failed: {}", e);
+            return 0;
+        }
+    };
+
+    let mut buf = alloc::vec![0; length];
+    if let Err(e) = file.read(&mut buf) {
+        ax_println!("read failed: {}", e);
+        return 0;
+    };
+
+    if let Err(e) = uspace.write(vaddr, &buf) {
+        ax_println!("write failed: {}", e);
+        return 0;
+    };
+
+    vaddr.as_usize() as isize
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {

@@ -67,6 +67,15 @@ impl DirNode {
         children.remove(name);
         Ok(())
     }
+
+    pub fn get_root(self: Arc<Self>) -> VfsNodeRef {
+        let mut current: VfsNodeRef = self;
+        while let Some(parent) = current.parent() {
+            current = parent;
+        }
+        current
+    }
+
 }
 
 impl VfsNodeOps for DirNode {
@@ -163,6 +172,29 @@ impl VfsNodeOps for DirNode {
         } else {
             self.remove_node(name)
         }
+    }
+
+    fn rename (&self , old: &str, new: &str) -> VfsResult {
+        let node = self.this.upgrade().expect("this node not found");
+        let old_node = node.clone().lookup(old)?;
+
+        let mut split = new.rsplit('/');
+        let new_file_name = split.next().expect("invalid path");
+        //TODO:保留为了后面可能的兼容跨fs进行
+        // let new_parent = split.remainder().expect("invalid path");
+
+        // let root = node.clone().get_root();
+        // let new_parent_node = root.clone().lookup(new_parent)?;
+
+        node.as_any() 
+            .downcast_ref::<DirNode>()
+            .expect("not a dir node")
+            .children
+            .write()
+            .insert(new_file_name.into(), old_node);
+
+        Ok(())
+    
     }
 
     axfs_vfs::impl_vfs_dir_default! {}
